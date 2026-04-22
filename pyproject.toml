@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "regent-sdk"
+version = "0.1.0"
+description = "Python SDK for Regent Protocol — AI agent identity, mandates, audit, and risk scoring"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Regent Protocol", email = "info@regentprotocol.org" }]
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.5.0",
+]
+
+[project.urls]
+Homepage = "https://regentprotocol.org"
+Repository = "https://github.com/abay94/regent-sdk-python"
+Documentation = "https://github.com/abay94/regent-sdk-python#readme"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "respx>=0.21.0",
+    "mypy>=1.8.0",
+    "ruff>=0.3.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/regent"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
