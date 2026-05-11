@@ -106,19 +106,30 @@ class HttpClient:
             pass
 
         # FastAPI's HTTPException wraps a dict detail in {"detail": {...}}.
-        # Accept both the flat error shape and the wrapped one.
-        detail = body.get("detail") if isinstance(body.get("detail"), dict) else {}
+        # An upstream service raising HTTPException(detail={"code": ...}) returns
+        # {"detail": {"code": ...}}, but a gateway proxying that with its own
+        # HTTPException can produce {"detail": {"detail": {"code": ...}}} — so
+        # walk down the detail chain until we find the actual error fields.
+        node: dict[str, Any] = body
+        for _ in range(4):  # cap depth — guards against pathological inputs
+            if isinstance(node, dict) and "code" not in node and isinstance(node.get("detail"), dict):
+                node = node["detail"]
+            else:
+                break
 
-        code: str = body.get("code") or detail.get("code") or "NETWORK_ERROR"
+        code: str = node.get("code") if isinstance(node, dict) else None
+        code = code or "NETWORK_ERROR"
         message: str = (
-            body.get("message") or detail.get("message") or f"HTTP {response.status_code}"
+            (node.get("message") if isinstance(node, dict) else None)
+            or f"HTTP {response.status_code}"
         )
         request_id: str | None = (
-            body.get("request_id")
-            or detail.get("request_id")
+            (node.get("request_id") if isinstance(node, dict) else None)
             or response.headers.get("x-request-id")
         )
-        details: dict[str, Any] | None = body.get("details") or detail.get("details")
+        details: dict[str, Any] | None = (
+            node.get("details") if isinstance(node, dict) else None
+        )
 
         raise RegentAPIError(
             message,
