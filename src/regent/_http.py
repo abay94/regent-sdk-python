@@ -105,12 +105,20 @@ class HttpClient:
         except Exception:  # noqa: BLE001
             pass
 
-        code: str = body.get("code") or "NETWORK_ERROR"
-        message: str = body.get("message") or f"HTTP {response.status_code}"
-        request_id: str | None = (
-            body.get("request_id") or response.headers.get("x-request-id")
+        # FastAPI's HTTPException wraps a dict detail in {"detail": {...}}.
+        # Accept both the flat error shape and the wrapped one.
+        detail = body.get("detail") if isinstance(body.get("detail"), dict) else {}
+
+        code: str = body.get("code") or detail.get("code") or "NETWORK_ERROR"
+        message: str = (
+            body.get("message") or detail.get("message") or f"HTTP {response.status_code}"
         )
-        details: dict[str, Any] | None = body.get("details")
+        request_id: str | None = (
+            body.get("request_id")
+            or detail.get("request_id")
+            or response.headers.get("x-request-id")
+        )
+        details: dict[str, Any] | None = body.get("details") or detail.get("details")
 
         raise RegentAPIError(
             message,
