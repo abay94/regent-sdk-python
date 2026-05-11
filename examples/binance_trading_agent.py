@@ -704,12 +704,29 @@ class BinanceTradingAgent:
                     last = self.rejections[-1]
                     print(f"  ✗ REJECTED  {last['reason']}")
                 await asyncio.sleep(step["sleep"])
-            # Revoke + post-revoke
-            print(f"\n--- REVOKING AGENT ---")
-            await self.regent.identity.revoke_agent(self.agent_id)
+            # Wait for manual revoke from the dashboard (5-min fallback)
+            print(f"\n--- WAITING FOR MANUAL REVOCATION ---")
+            print(f"    On the dashboard: Agents → {self.agent_id[:24]}… → Revoke")
+            start = time.time()
+            manual = False
+            while time.time() - start < 300:
+                try:
+                    a = await self.regent.identity.get_agent(self.agent_id)
+                    if a.status != "active":
+                        manual = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+            if not manual:
+                print(f"    Timeout — falling back to programmatic revoke")
+                try:
+                    await self.regent.identity.revoke_agent(self.agent_id)
+                except Exception:
+                    pass
             self._is_revoked = True
             self._current_phase = "REVOKED"
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             print(f"\n--- POST-REVOKE TRADE (should fail) ---")
             await self._execute_trade("BUY", 50.0)
             await asyncio.sleep(5)
@@ -735,13 +752,28 @@ class BinanceTradingAgent:
                 live.update(self._render_dashboard())
                 await asyncio.sleep(step["sleep"])
 
-            # Revoke
-            self._current_phase = "revoking…"
+            # Wait for manual revoke from dashboard (5-min fallback)
+            self._current_phase = "waiting for manual revoke from dashboard…"
             live.update(self._render_dashboard())
-            try:
-                await self.regent.identity.revoke_agent(self.agent_id)
-            except Exception:
-                pass
+            start = time.time()
+            manual = False
+            while time.time() - start < 300:
+                try:
+                    a = await self.regent.identity.get_agent(self.agent_id)
+                    if a.status != "active":
+                        manual = True
+                        break
+                except Exception:
+                    pass
+                elapsed = int(time.time() - start)
+                self._current_phase = f"waiting for manual revoke… ({elapsed}s elapsed)"
+                live.update(self._render_dashboard())
+                await asyncio.sleep(2)
+            if not manual:
+                try:
+                    await self.regent.identity.revoke_agent(self.agent_id)
+                except Exception:
+                    pass
             self._is_revoked = True
             self._current_phase = "REVOKED"
             await self._refresh_agent_info()
