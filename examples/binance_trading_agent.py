@@ -45,6 +45,19 @@ import httpx
 from regent import RegentClient, AuthorizeRequest, IngestEventRequest
 from regent.errors import RegentAPIError
 
+# Rich is optional — falls back to plain prints if not installed.
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.layout import Layout
+    from rich.table import Table
+    from rich.text import Text
+    from rich.align import Align
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
 # ============================================================================
 # CONFIG
 # ============================================================================
@@ -64,6 +77,33 @@ TRADE_AMOUNT_USD = 50.0
 MAX_TRADES = 5
 LOOP_INTERVAL = 30
 PRICE_THRESHOLD = 0.00001  # 0.001% — low threshold for testnet (price barely moves)
+
+# ============================================================================
+# DEMO MODE
+# ============================================================================
+# DEMO_MODE=true runs a deterministic 11-step scripted sequence designed for
+# a ~1.5 min screencast. Mandate must be: per_tx=$50, daily=$300, monthly=$5000.
+
+DEMO_MODE = os.environ.get("DEMO_MODE", "").lower() in ("1", "true", "yes")
+
+DEMO_SEQUENCE: list[dict] = [
+    # Phase 1 — baseline (2 trades, normal pacing)
+    {"side": "BUY",  "amount": 50,   "sleep": 10, "phase": "P1 baseline"},
+    {"side": "SELL", "amount": 50,   "sleep": 10, "phase": "P1 baseline"},
+    # Phase 2 — Guardian burst (5 trades in ~2.5s, then 8s pause for alert)
+    {"side": "BUY",  "amount": 50,   "sleep": 0.5, "phase": "P2 burst"},
+    {"side": "BUY",  "amount": 200,  "sleep": 0.5, "phase": "P2 burst"},
+    {"side": "SELL", "amount": 50,   "sleep": 0.5, "phase": "P2 burst"},
+    {"side": "BUY",  "amount": 500,  "sleep": 0.5, "phase": "P2 burst"},
+    {"side": "BUY",  "amount": 1000, "sleep": 8,   "phase": "P2 burst"},
+    # Phase 3 — recovery (risk score visibly elevated)
+    {"side": "BUY",  "amount": 50,   "sleep": 10, "phase": "P3 recovery"},
+    # Phase 4 — hit daily limit exactly
+    {"side": "BUY",  "amount": 50,   "sleep": 10, "phase": "P4 hit limit"},
+    # Phase 5 — rejections (daily, then per-tx)
+    {"side": "BUY",  "amount": 50,   "sleep": 10, "phase": "P5 reject"},
+    {"side": "BUY",  "amount": 500,  "sleep": 8,  "phase": "P5 reject"},
+]
 
 
 # ============================================================================
@@ -137,6 +177,14 @@ class BinanceTradingAgent:
         self.mandate_id = mandate_id
         self.trades: list[dict] = []
         self.rejections: list[dict] = []
+        # Demo / TUI state (populated only when demo mode runs)
+        self._agent_info: dict = {}     # cached from setup(): bot_name, did, status, etc.
+        self._mandate_info: dict = {}    # cached from setup(): per_tx, daily, monthly limits
+        self._last_klines: list = []    # last 60 1m closes for sparkline
+        self._last_price: float = 0.0
+        self._current_phase: str = "setup"
+        self._is_revoked: bool = False
+        self._last_risk_score: float | None = None
 
     async def setup(self):
         print("\n" + "=" * 60)
@@ -293,6 +341,420 @@ class BinanceTradingAgent:
         ))
         print(f"  Trade #{len(self.trades)} logged to Regent audit trail.")
 
+    # ========================================================================
+    # DEMO MODE — scripted sequence + Rich TUI
+    # ========================================================================
+
+    async def _execute_trade(self, side: str, amount: float) -> None:
+        """Authorize → fill on Binance → audit. Used by _demo_loop.
+
+        Mirrors the logic in _trading_round but without the price-signal
+        decision: just executes the (side, amount) the caller picked.
+        """
+        jti = None
+        try:
+            price = await self.binance.get_price(SYMBOL)
+        except Exception:
+            price = self._last_price or 0.0
+        self._last_price = price
+
+        # 1. Authorize through Regent (if mandate configured)
+        if self.mandate_id:
+            try:
+                auth = await self.regent.payment.authorize(
+                    self.mandate_id,
+                    AuthorizeRequest(amount=Decimal(str(amount)), currency="USD"),
+                )
+                jti = auth.jti
+                if auth.guardian_score is not None:
+                    self._last_risk_score = float(auth.guardian_score)
+            except RegentAPIError as e:
+                self.rejections.append({
+                    "side": side, "amount": amount, "reason": e.code,
+                    "time": datetime.now(UTC).isoformat(), "price": price,
+                })
+                try:
+                    await self.regent.audit.ingest_event(IngestEventRequest(
+                        event_id=f"trade-rejected-{uuid.uuid4().hex[:12]}",
+                        agent_id=self.agent_id,
+                        event_type="trade.rejected",
+                        payload={
+                            "side": side, "amount": str(amount),
+                            "reason": e.code, "price": str(price),
+                        },
+                    ))
+                except Exception:
+                    pass  # Don't break the demo on audit failure
+                return
+
+        # 2. Fill on Binance testnet
+        try:
+            order = await self.binance.place_order(SYMBOL, side, amount)
+        except Exception as e:
+            self.rejections.append({
+                "side": side, "amount": amount,
+                "reason": f"BINANCE_ERROR: {str(e)[:40]}",
+                "time": datetime.now(UTC).isoformat(), "price": price,
+            })
+            return
+
+        order_id = str(order.get("orderId", "unknown"))
+        filled_qty = float(order.get("executedQty", "0"))
+        filled_quote = float(order.get("cummulativeQuoteQty", "0"))
+
+        self.trades.append({
+            "side": side, "price": price, "amount_usd": filled_quote,
+            "btc_qty": filled_qty, "order_id": order_id, "jti": jti,
+            "time": datetime.now(UTC).isoformat(),
+        })
+
+        # 3. Audit
+        try:
+            await self.regent.audit.ingest_event(IngestEventRequest(
+                event_id=f"trade-{order_id}-{uuid.uuid4().hex[:8]}",
+                agent_id=self.agent_id,
+                event_type="trade.executed",
+                payload={
+                    "exchange": "binance-testnet", "symbol": SYMBOL, "side": side,
+                    "price": str(price), "amount_usd": str(filled_quote),
+                    "btc_qty": str(filled_qty), "order_id": order_id,
+                    "authorization_jti": jti,
+                },
+            ))
+        except Exception:
+            pass
+
+    # --- TUI helpers ---------------------------------------------------------
+
+    def _portfolio(self) -> dict:
+        """Compute USDT/BTC balance and P&L from local trade history.
+
+        Start: USDT=5000, BTC=0. BUY → USDT -= amount, BTC += qty.
+        SELL → USDT += amount, BTC -= qty. P&L = total - 5000.
+        """
+        usdt, btc = 5000.0, 0.0
+        for t in self.trades:
+            if t["side"] == "BUY":
+                usdt -= t["amount_usd"]
+                btc += t["btc_qty"]
+            else:
+                usdt += t["amount_usd"]
+                btc -= t["btc_qty"]
+        btc_value = btc * (self._last_price or 0.0)
+        total = usdt + btc_value
+        pnl = total - 5000.0
+        return {"usdt": usdt, "btc": btc, "btc_value": btc_value,
+                "total": total, "pnl": pnl, "pnl_pct": (pnl / 5000.0) * 100}
+
+    def _mandate_usage(self) -> dict:
+        """Sum trade + rejection amounts today / this month UTC."""
+        now = datetime.now(UTC)
+        today = now.date()
+        month_start = today.replace(day=1)
+        daily, monthly = 0.0, 0.0
+        for t in self.trades:
+            ts = datetime.fromisoformat(t["time"]).date()
+            if ts >= today:
+                daily += t["amount_usd"]
+            if ts >= month_start:
+                monthly += t["amount_usd"]
+        return {"daily": daily, "monthly": monthly}
+
+    def _sparkline(self, prices: list[float], width: int = 50) -> str:
+        """Unicode block sparkline from a list of float prices."""
+        if not prices or len(prices) < 2:
+            return "·" * width
+        blocks = "▁▂▃▄▅▆▇█"
+        lo, hi = min(prices), max(prices)
+        rng = hi - lo if hi != lo else 1.0
+        # Sample down to `width` points
+        step = max(1, len(prices) // width)
+        sampled = prices[::step][:width]
+        return "".join(blocks[min(7, int((p - lo) / rng * 7))] for p in sampled)
+
+    def _render_dashboard(self) -> "Layout":  # type: ignore[name-defined]
+        """Build the live Rich Layout for the TUI."""
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=4),
+            Layout(name="body"),
+            Layout(name="footer", size=3),
+        )
+        layout["body"].split_row(
+            Layout(name="main", ratio=3),
+            Layout(name="side", ratio=2),
+        )
+        layout["main"].split_column(
+            Layout(name="price", size=8),
+            Layout(name="feed"),
+        )
+        layout["side"].split_column(
+            Layout(name="portfolio", size=7),
+            Layout(name="mandate", size=8),
+            Layout(name="risk", size=5),
+            Layout(name="onchain", size=7),
+        )
+
+        # ---- HEADER ----
+        info = self._agent_info
+        m = self._mandate_info
+        status_color = "red" if self._is_revoked else "green"
+        status_label = "● REVOKED" if self._is_revoked else "● ACTIVE"
+        mandate_line = (
+            f"Mandate: [bold cyan]${int(m.get('per_tx', 0))}[/]/[bold cyan]${int(m.get('daily', 0))}[/]/[bold cyan]${int(m.get('monthly', 0))}[/]"
+            if m else "Mandate: [dim]not configured[/]"
+        )
+        header_text = Text.from_markup(
+            f"[bold]{info.get('bot_name', 'agent')}[/]   "
+            f"agent: [dim]{(info.get('agent_id') or '')[:24]}…[/]   "
+            f"[cyan]{info.get('did', '')[:38]}…[/]\n"
+            f"[{status_color}]{status_label}[/]   {mandate_line}   "
+            f"On-chain: [cyan]{info.get('onchain_status', '—')}[/]"
+        )
+        layout["header"].update(Panel(header_text, title="Regent Protocol · Live Demo",
+                                       border_style="cyan"))
+
+        # ---- PRICE + SPARKLINE ----
+        closes = [float(k[4]) for k in (self._last_klines or [])]
+        spark = self._sparkline(closes, width=56)
+        price_disp = self._last_price or (closes[-1] if closes else 0.0)
+        change = 0.0
+        if len(closes) >= 2:
+            change = ((closes[-1] - closes[0]) / closes[0]) * 100 if closes[0] else 0.0
+        change_color = "green" if change >= 0 else "red"
+        change_arrow = "▲" if change >= 0 else "▼"
+        price_text = Text.from_markup(
+            f"[bold cyan]BTC/USDT[/]   [bold]${price_disp:,.2f}[/]   "
+            f"[{change_color}]{change_arrow} {abs(change):.2f}%[/]   "
+            f"[dim](last 60m)[/]\n[cyan]{spark}[/]"
+        )
+        layout["price"].update(Panel(price_text, border_style="cyan"))
+
+        # ---- TRADE FEED ----
+        feed_table = Table.grid(padding=(0, 1), expand=True)
+        feed_table.add_column(width=8)   # time
+        feed_table.add_column(width=2)   # icon
+        feed_table.add_column(width=5)   # side
+        feed_table.add_column(width=8, justify="right")  # amount
+        feed_table.add_column(ratio=1)   # detail
+        # Merge trades + rejections, newest first
+        feed_items = (
+            [{"ok": True,  **t} for t in self.trades] +
+            [{"ok": False, **r} for r in self.rejections]
+        )
+        feed_items.sort(key=lambda x: x["time"], reverse=True)
+        for item in feed_items[:15]:
+            ts = item["time"][11:19] if "T" in item["time"] else item["time"][:8]
+            if item["ok"]:
+                feed_table.add_row(
+                    f"[dim]{ts}[/]", "[green]✓[/]", f"[green]{item['side']}[/]",
+                    f"[bold]${item['amount_usd']:.2f}[/]",
+                    f"[dim]jti {str(item.get('jti') or '')[:10]}…  @${item['price']:,.0f}[/]",
+                )
+            else:
+                feed_table.add_row(
+                    f"[dim]{ts}[/]", "[red]✗[/]", f"[red]{item['side']}[/]",
+                    f"[red]${item['amount']:.2f}[/]",
+                    f"[red]{item['reason']}[/]",
+                )
+        if not feed_items:
+            feed_table.add_row("", "", "[dim]waiting…[/]", "", "")
+        layout["feed"].update(Panel(feed_table, title="Trade Feed", border_style="cyan"))
+
+        # ---- PORTFOLIO ----
+        p = self._portfolio()
+        pnl_color = "green" if p["pnl"] >= 0 else "red"
+        pnl_sign = "+" if p["pnl"] >= 0 else ""
+        portfolio_text = Text.from_markup(
+            f"[dim]USDT[/]   [bold]${p['usdt']:,.2f}[/]\n"
+            f"[dim]BTC [/]   [bold]{p['btc']:.6f}[/] "
+            f"[dim](≈${p['btc_value']:,.2f})[/]\n"
+            f"[dim]P&L [/]   [{pnl_color}]{pnl_sign}${p['pnl']:,.2f}[/] "
+            f"[{pnl_color}]({pnl_sign}{p['pnl_pct']:.2f}%)[/]"
+        )
+        layout["portfolio"].update(Panel(portfolio_text, title="Portfolio",
+                                          border_style="green"))
+
+        # ---- MANDATE USAGE ----
+        u = self._mandate_usage()
+        per_tx_lim = m.get("per_tx", 0) or 1
+        daily_lim = m.get("daily", 0) or 1
+        monthly_lim = m.get("monthly", 0) or 1
+        last_amount = self.trades[-1]["amount_usd"] if self.trades else 0
+        mandate_table = Table.grid(padding=(0, 1), expand=True)
+        mandate_table.add_column(width=8)
+        mandate_table.add_column(ratio=1)
+        mandate_table.add_column(width=14, justify="right")
+        for label, used, lim in [
+            ("per-tx", last_amount, per_tx_lim),
+            ("daily",  u["daily"],  daily_lim),
+            ("month",  u["monthly"], monthly_lim),
+        ]:
+            pct = min(100, int((used / lim) * 100)) if lim else 0
+            bar_color = "red" if pct >= 95 else "yellow" if pct >= 70 else "green"
+            filled = pct // 5
+            bar = f"[{bar_color}]" + ("▓" * filled) + "[/]" + ("░" * (20 - filled))
+            mandate_table.add_row(
+                f"[dim]{label}[/]", bar,
+                f"[bold]${int(used)}[/]/[dim]${int(lim)}[/]",
+            )
+        layout["mandate"].update(Panel(mandate_table, title="Mandate Usage",
+                                        border_style="yellow"))
+
+        # ---- RISK GAUGE ----
+        rs = self._last_risk_score
+        if rs is None:
+            risk_text = Text.from_markup("[dim]no score yet — Guardian watching…[/]")
+        else:
+            filled = int(rs * 20)
+            color = "red" if rs >= 0.7 else "yellow" if rs >= 0.4 else "green"
+            risk_bar = f"[{color}]" + "▓" * filled + "[/]" + "░" * (20 - filled)
+            risk_text = Text.from_markup(
+                f"[bold]{rs:.3f}[/]   {risk_bar}\n"
+                f"[dim]Guardian (Isolation Forest + SHAP)[/]"
+            )
+        layout["risk"].update(Panel(risk_text, title="Risk Gauge", border_style="red"))
+
+        # ---- ON-CHAIN ----
+        onchain_text = Text.from_markup(
+            f"[dim]Status:    [/][cyan]{info.get('onchain_status', '—')}[/]\n"
+            f"[dim]Trades OK: [/][green]{len(self.trades)}[/]\n"
+            f"[dim]Rejected:  [/][red]{len(self.rejections)}[/]\n"
+            f"[dim]Solana tx: [/][cyan]{(info.get('solana_tx') or '—')[:24]}…[/]"
+        )
+        layout["onchain"].update(Panel(onchain_text, title="On-Chain",
+                                        border_style="cyan"))
+
+        # ---- FOOTER ----
+        total_actions = len(self.trades) + len(self.rejections)
+        footer = Text.from_markup(
+            f"[{status_color}]{status_label}[/]   "
+            f"{total_actions} actions · "
+            f"[green]{len(self.trades)} authorized[/] · "
+            f"[red]{len(self.rejections)} rejected[/]   "
+            f"phase: [bold]{self._current_phase}[/]"
+        )
+        layout["footer"].update(Panel(Align.center(footer), border_style="dim"))
+
+        return layout
+
+    async def _refresh_agent_info(self) -> None:
+        """Pull current agent + mandate state into self._agent_info / _mandate_info."""
+        try:
+            a = await self.regent.identity.get_agent(self.agent_id)
+            self._agent_info = {
+                "agent_id": a.agent_id,
+                "did": a.did or "",
+                "status": a.status,
+                "onchain_status": a.onchain_status,
+                "solana_tx": a.solana_tx or "",
+                "bot_name": (a.metadata or {}).get("bot_name", "demo-bot")
+                            if hasattr(a, "metadata") and isinstance(a.metadata, dict)
+                            else "demo-bot",
+            }
+        except Exception:
+            pass
+        if self.mandate_id:
+            try:
+                m = await self.regent.payment.get_mandate(self.mandate_id)
+                self._mandate_info = {
+                    "per_tx": float(m.limits.per_tx_limit or 0),
+                    "daily": float(m.limits.daily_limit or 0),
+                    "monthly": float(m.limits.monthly_limit or 0),
+                }
+            except Exception:
+                pass
+
+    async def _refresh_risk_score(self) -> None:
+        """Best-effort pull of latest Guardian score (independent of authorize response)."""
+        try:
+            rs = await self.regent.guardian.get_latest_score(self.agent_id)
+            if rs and rs.score is not None:
+                self._last_risk_score = float(rs.score)
+        except Exception:
+            pass
+
+    async def _demo_loop(self) -> None:
+        """Run the 11-step scripted sequence + revoke + post-revoke attempt."""
+        await self._refresh_agent_info()
+        try:
+            self._last_klines = await self.binance.get_klines(SYMBOL, "1m", 60)
+            self._last_price = float(self._last_klines[-1][4])
+        except Exception:
+            pass
+
+        if not RICH_AVAILABLE:
+            # Plain-text fallback
+            print("\n" + "=" * 60)
+            print("  DEMO MODE — plain output (install `rich` for TUI)")
+            print("=" * 60)
+            for i, step in enumerate(DEMO_SEQUENCE, 1):
+                self._current_phase = step["phase"]
+                print(f"\n[{i}/{len(DEMO_SEQUENCE)}] {step['phase']}: "
+                      f"{step['side']} ${step['amount']}")
+                await self._execute_trade(step["side"], float(step["amount"]))
+                if self.trades and self.trades[-1].get("time") == max(
+                    (t["time"] for t in self.trades), default=""
+                ):
+                    last = self.trades[-1]
+                    print(f"  ✓ FILLED  jti={(last.get('jti') or '')[:16]}…")
+                elif self.rejections and self.rejections[-1].get("time") == max(
+                    (r["time"] for r in self.rejections), default=""
+                ):
+                    last = self.rejections[-1]
+                    print(f"  ✗ REJECTED  {last['reason']}")
+                await asyncio.sleep(step["sleep"])
+            # Revoke + post-revoke
+            print(f"\n--- REVOKING AGENT ---")
+            await self.regent.identity.revoke_agent(self.agent_id)
+            self._is_revoked = True
+            self._current_phase = "REVOKED"
+            await asyncio.sleep(3)
+            print(f"\n--- POST-REVOKE TRADE (should fail) ---")
+            await self._execute_trade("BUY", 50.0)
+            await asyncio.sleep(5)
+            return
+
+        # Rich TUI mode
+        console = Console()
+        with Live(self._render_dashboard(), console=console,
+                  refresh_per_second=2, screen=True) as live:
+            for i, step in enumerate(DEMO_SEQUENCE, 1):
+                self._current_phase = f"{step['phase']} ({i}/{len(DEMO_SEQUENCE)})"
+                live.update(self._render_dashboard())
+                await self._execute_trade(step["side"], float(step["amount"]))
+                # Refresh klines every 3rd step (Binance rate limit friendly)
+                if i % 3 == 0:
+                    try:
+                        self._last_klines = await self.binance.get_klines(SYMBOL, "1m", 60)
+                    except Exception:
+                        pass
+                # Pull risk score periodically
+                if i % 2 == 0:
+                    await self._refresh_risk_score()
+                live.update(self._render_dashboard())
+                await asyncio.sleep(step["sleep"])
+
+            # Revoke
+            self._current_phase = "revoking…"
+            live.update(self._render_dashboard())
+            try:
+                await self.regent.identity.revoke_agent(self.agent_id)
+            except Exception:
+                pass
+            self._is_revoked = True
+            self._current_phase = "REVOKED"
+            await self._refresh_agent_info()
+            live.update(self._render_dashboard())
+            await asyncio.sleep(3)
+
+            # Post-revoke attempt — should fail with AGENT_NOT_ACTIVE
+            self._current_phase = "post-revoke attempt"
+            live.update(self._render_dashboard())
+            await self._execute_trade("BUY", 50.0)
+            live.update(self._render_dashboard())
+            await asyncio.sleep(5)
+
     async def print_summary(self):
         print("\n" + "=" * 60)
         print("  TRADING SESSION SUMMARY")
@@ -374,7 +836,10 @@ async def main():
             mandate_id=REGENT_MANDATE_ID or None,
         )
         await agent.setup()
-        await agent.run_loop()
+        if DEMO_MODE:
+            await agent._demo_loop()
+        else:
+            await agent.run_loop()
         await agent.print_summary()
     finally:
         await regent.aclose()
